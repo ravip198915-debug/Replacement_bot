@@ -36,6 +36,8 @@ DISTRICT_REPLACEMENTS = {
 
 def normalize_district_name(value):
     district = str(value).strip().title()
+    if district == "Vilupuram":
+        district = "Viluppuram"
     return DISTRICT_REPLACEMENTS.get(district, district)
 
 
@@ -57,6 +59,9 @@ def clean_report_dataframe(df):
     if "spare" in cleaned.columns:
         cleaned["spare"] = cleaned["spare"].astype(str).str.strip()
 
+    if "taluk" in cleaned.columns:
+        cleaned["taluk"] = cleaned["taluk"].astype(str).str.strip().str.title()
+
     return cleaned
 
 
@@ -70,6 +75,8 @@ def validate_clean_data(df):
         te_series = df["te"].astype(str)
         if te_series.str.contains(r"\.|\s{2,}", regex=True).any():
             raise ValueError("TE normalization failed: inconsistent TE names detected")
+        if te_series.str.strip().eq("").any():
+            raise ValueError("Validation failed: empty TE names found")
 
 
 BOT_TOKEN = "8730404668:AAH4DByLGuRbfJ8gVHjPpKINwl5WPGvRqaA"
@@ -594,9 +601,32 @@ def send_excel(message):
 
 from openpyxl import load_workbook
 from openpyxl.styles import Font, PatternFill, Border, Side, Alignment
+from openpyxl.worksheet.datavalidation import DataValidation
+from openpyxl.utils import get_column_letter
 
 # ⭐ Create reports folder automatically
 os.makedirs("reports", exist_ok=True)
+
+EMPLOYEE_MASTER_FILE = "Emp_code_name.xlsx"
+
+
+def load_employee_master():
+    emp_df = pd.read_excel(EMPLOYEE_MASTER_FILE)
+    emp_df.columns = emp_df.columns.str.strip().str.lower()
+
+    required = {"employee_code", "employee_name"}
+    if not required.issubset(set(emp_df.columns)):
+        raise ValueError("Emp_code_name.xlsx must contain employee_code and employee_name columns")
+
+    emp_df["employee_code"] = emp_df["employee_code"].astype(str).str.strip().str.upper()
+    emp_df["employee_name"] = emp_df["employee_name"].astype(str).replace("nan", "").map(normalize_te_name)
+    emp_df["display"] = emp_df["employee_code"] + " - " + emp_df["employee_name"]
+    emp_df = emp_df[emp_df["employee_name"].str.strip() != ""].drop_duplicates(subset=["display"])
+
+    if emp_df.empty:
+        raise ValueError("Emp_code_name.xlsx does not contain valid employee records")
+
+    return emp_df
 
 def export_excel():
 
@@ -606,7 +636,26 @@ def export_excel():
     if df.empty:
         raise ValueError("No reports available to export")
 
+    emp_df = load_employee_master()
+
     validate_clean_data(df)
+
+    if "te" in df.columns and df["te"].astype(str).str.strip().eq("").any():
+        raise ValueError("Validation failed: empty TE names found")
+
+    full_report_df = df.copy()
+    full_report_df["employee_code"] = (
+        full_report_df["te"]
+        .astype(str)
+        .str.extract(r"^\s*([A-Za-z0-9]+)\s*-\s*.*$", expand=False)
+        .fillna("")
+    )
+    full_report_df["employee_name"] = (
+        full_report_df["te"]
+        .astype(str)
+        .str.extract(r"^\s*[A-Za-z0-9]+\s*-\s*(.*)$", expand=False)
+        .fillna("")
+    )
 
     district_summary = (
         df.groupby("district", as_index=False)
@@ -616,17 +665,24 @@ def export_excel():
     )
 
     te_summary = (
-        df.groupby(["te", "district"], as_index=False)
+        df.groupby(["te", "district", "taluk"], as_index=False)
         .size()
-        .rename(columns={"te": "TE Name", "district": "District", "size": "Total Count"})
+        .rename(
+            columns={
+                "te": "TE Name",
+                "district": "District",
+                "taluk": "Taluk",
+                "size": "Total Count"
+            }
+        )
         .sort_values(by="Total Count", ascending=False)
     )
 
     spare_summary = (
         df.groupby(["district", "spare"], as_index=False)
         .size()
-        .rename(columns={"district": "District", "spare": "Spare Name", "size": "Total Count"})
-        .sort_values(by=["District", "Total Count"], ascending=[True, False])
+        .rename(columns={"district": "District", "spare": "Spare Name", "size": "Count"})
+        .sort_values(by=["District", "Count"], ascending=[True, False])
     )
 
     now = datetime.now()
@@ -646,10 +702,15 @@ def export_excel():
 
     with pd.ExcelWriter(file, engine="openpyxl") as writer:
 
-        df.to_excel(writer, sheet_name="Full Report", index=False)
+        full_report_df.to_excel(writer, sheet_name="Full Report", index=False)
         district_summary.to_excel(writer, sheet_name="District Summary", index=False)
         te_summary.to_excel(writer, sheet_name="TE Performance", index=False)
         spare_summary.to_excel(writer, sheet_name="Spare-wise District Summary", index=False)
+        emp_df[["display", "employee_code", "employee_name"]].to_excel(
+            writer,
+            sheet_name="Employee Master",
+            index=False
+        )
 
     # ================= FORMAT EXCEL =================
 
@@ -705,6 +766,56 @@ def export_excel():
             column = col[0].column_letter
             max_length = max(len(str(cell.value)) if cell.value is not None else 0 for cell in col)
             ws.column_dimensions[column].width = max_length + 3
+
+    # ================= TE DROPDOWN + AUTO-FILL =================
+
+    full_ws = wb["Full Report"]
+    emp_ws = wb["Employee Master"]
+
+    header_map = {}
+    for cell in full_ws[1]:
+        header_map[str(cell.value).strip().lower()] = cell.column
+
+    te_col_idx = header_map.get("te")
+    emp_code_col_idx = header_map.get("employee_code")
+    emp_name_col_idx = header_map.get("employee_name")
+
+    if te_col_idx is None:
+        raise ValueError("Validation failed: TE column missing in Full Report sheet")
+
+    max_rows = max(full_ws.max_row, 1000)
+    emp_last_row = emp_ws.max_row
+    if emp_last_row < 2:
+        raise ValueError("Validation failed: employee dropdown list is empty")
+
+    te_col_letter = get_column_letter(te_col_idx)
+    emp_code_col_letter = get_column_letter(emp_code_col_idx)
+    emp_name_col_letter = get_column_letter(emp_name_col_idx)
+
+    dv = DataValidation(
+        type="list",
+        formula1=f"'Employee Master'!$A$2:$A${emp_last_row}",
+        allow_blank=False
+    )
+    full_ws.add_data_validation(dv)
+    dv.add(f"{te_col_letter}2:{te_col_letter}{max_rows}")
+
+    for row_idx in range(2, max_rows + 1):
+        te_cell = f"{te_col_letter}{row_idx}"
+        full_ws[f"{emp_code_col_letter}{row_idx}"] = (
+            f'=IFERROR(LEFT({te_cell},FIND(" - ",{te_cell})-1),"")'
+        )
+        full_ws[f"{emp_name_col_letter}{row_idx}"] = (
+            f'=IFERROR(MID({te_cell},FIND(" - ",{te_cell})+3,255),"")'
+        )
+
+    emp_ws.sheet_state = "hidden"
+
+    # Post-format width update to include formula columns
+    for col in full_ws.columns:
+        column = col[0].column_letter
+        max_length = max(len(str(cell.value)) if cell.value is not None else 0 for cell in col)
+        full_ws.column_dimensions[column].width = max_length + 3
 
     wb.save(file)
     

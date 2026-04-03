@@ -168,6 +168,30 @@ data["FPS Code"] = data["FPS Code"].astype(str).str.strip()
 districts = sorted(data["District"].dropna().unique())
 spares = sorted(data["Name of Spare Replaced"].dropna().unique())
 
+# ================= LOAD EMPLOYEE MASTER =================
+
+EMPLOYEE_MASTER_FILE = "Emp_code_name.xlsx"
+
+try:
+    emp_df = pd.read_excel(EMPLOYEE_MASTER_FILE)
+    emp_df.columns = [col.strip().lower().replace(" ", "_") for col in emp_df.columns]
+    emp_df.rename(
+        columns={
+            "employee_code": "employee_code",
+            "employee_name": "employee_name"
+        },
+        inplace=True
+    )
+    if "employee_code" not in emp_df.columns or "employee_name" not in emp_df.columns:
+        raise ValueError("Missing required columns: employee_code and employee_name")
+
+    emp_df["employee_code"] = emp_df["employee_code"].astype(str).str.strip()
+    emp_df["employee_name"] = emp_df["employee_name"].astype(str).map(normalize_te_name)
+    emp_df = emp_df[emp_df["employee_code"] != ""].drop_duplicates(subset=["employee_code"], keep="first")
+except Exception as e:
+    print(f"WARNING: Unable to load {EMPLOYEE_MASTER_FILE}: {e}")
+    emp_df = pd.DataFrame(columns=["employee_code", "employee_name"])
+
 # ================= START COMMAND =================
 
 @bot.message_handler(commands=['start','report'])
@@ -324,8 +348,8 @@ def handler(message):
             # Leave new_serial blank
             user[chat]["data"].append("")
 
-            bot.send_message(chat,"Enter Name of TE")
-            user[chat]["step"] = "te"
+            bot.send_message(chat,"Enter Employee Code (Example: 8110)")
+            user[chat]["step"] = "te_code"
     # ================= SERIAL SEARCH =================
 
     elif step == "new_serial_search":
@@ -370,19 +394,45 @@ def handler(message):
 
         print("Saving serial:", full_serial)
 
-        bot.send_message(chat,"Enter Name of TE",reply_markup=ReplyKeyboardRemove())
+        bot.send_message(chat,"Enter Employee Code (Example: 8110)",reply_markup=ReplyKeyboardRemove())
 
-        user[chat]["step"] = "te"
+        user[chat]["step"] = "te_code"
 
-    elif step == "te":
+    elif step == "te_code":
+        code = text.strip()
 
-        user[chat]["data"].append(normalize_te_name(text))
+        if not code:
+            bot.send_message(chat, "❌ Employee code cannot be empty. Enter Employee Code (Example: 8110)")
+            return
 
-        bot.send_message(chat,"Enter Shopkeeper Name")
+        if not code.isdigit():
+            bot.send_message(chat, "❌ Enter valid numeric employee code")
+            return
 
-       
+        match = emp_df[emp_df["employee_code"] == code]
 
-        user[chat]["step"] = "shopkeeper_name"
+        if not match.empty:
+            name = match.iloc[0]["employee_name"]
+            te_value = f"{code} - {name}"
+            user[chat]["data"].append(te_value)
+            bot.send_message(chat, f"✅ {te_value}")
+            bot.send_message(chat,"Enter Shopkeeper Name")
+            user[chat]["step"] = "shopkeeper_name"
+            return
+
+        partial_matches = emp_df[emp_df["employee_code"].str.contains(code, na=False)].head(5)
+        if not partial_matches.empty:
+            options = "\n".join(
+                f"{row.employee_code} - {row.employee_name}" for row in partial_matches.itertuples()
+            )
+            bot.send_message(
+                chat,
+                f"❌ No exact match for {code}.\nDid you mean:\n{options}\n\nPlease enter exact Employee Code."
+            )
+            return
+
+        bot.send_message(chat, "❌ Invalid Employee Code. Please try again.")
+        return
 
     elif step == "shopkeeper_name":
         
@@ -598,8 +648,6 @@ from openpyxl.utils import get_column_letter
 
 # ⭐ Create reports folder automatically
 os.makedirs("reports", exist_ok=True)
-
-EMPLOYEE_MASTER_FILE = "Emp_code_name.xlsx"
 
 
 def load_employee_master():

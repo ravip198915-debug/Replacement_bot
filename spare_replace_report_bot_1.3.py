@@ -28,6 +28,49 @@ DISTRICT_MANAGERS = {
 
 }
 
+DISTRICT_REPLACEMENTS = {
+    "Vilupuram": "Viluppuram",
+    "Villupuram": "Viluppuram"
+}
+
+
+def normalize_district_name(value):
+    district = str(value).strip().title()
+    return DISTRICT_REPLACEMENTS.get(district, district)
+
+
+def normalize_te_name(value):
+    te = str(value).replace(".", " ").strip().title()
+    te = " ".join(te.split())
+    return te
+
+
+def clean_report_dataframe(df):
+    cleaned = df.copy()
+
+    if "district" in cleaned.columns:
+        cleaned["district"] = cleaned["district"].astype(str).map(normalize_district_name)
+
+    if "te" in cleaned.columns:
+        cleaned["te"] = cleaned["te"].astype(str).map(normalize_te_name)
+
+    if "spare" in cleaned.columns:
+        cleaned["spare"] = cleaned["spare"].astype(str).str.strip()
+
+    return cleaned
+
+
+def validate_clean_data(df):
+    if "district" in df.columns:
+        district_series = df["district"].astype(str)
+        if district_series.str.contains("Vilupuram", case=False, regex=False).any():
+            raise ValueError("District normalization failed: found 'Vilupuram'")
+
+    if "te" in df.columns:
+        te_series = df["te"].astype(str)
+        if te_series.str.contains(r"\.|\s{2,}", regex=True).any():
+            raise ValueError("TE normalization failed: inconsistent TE names detected")
+
 
 BOT_TOKEN = "8730404668:AAH4DByLGuRbfJ8gVHjPpKINwl5WPGvRqaA"
 MANAGER_IDS = [1412356698,587636725,7887580509,838686002,8641112788,8502188931,7170102897]
@@ -119,7 +162,7 @@ data = pd.read_excel(dropdown_file)
 
 data.columns = data.columns.str.strip()
 
-data["District"] = data["District"].astype(str).str.strip()
+data["District"] = data["District"].astype(str).map(normalize_district_name)
 data["Taluk"] = data["Taluk"].astype(str).str.strip()
 data["FPS Code"] = data["FPS Code"].astype(str).str.strip()
 
@@ -166,9 +209,10 @@ def handler(message):
 
     if step == "district":
 
-        user[chat]["data"].append(text)
+        normalized_district = normalize_district_name(text)
+        user[chat]["data"].append(normalized_district)
 
-        taluks = data[data["District"]==text]["Taluk"].unique()
+        taluks = data[data["District"] == normalized_district]["Taluk"].unique()
 
         markup = ReplyKeyboardMarkup(resize_keyboard=True)
 
@@ -333,7 +377,7 @@ def handler(message):
 
     elif step == "te":
 
-        user[chat]["data"].append(text)
+        user[chat]["data"].append(normalize_te_name(text))
 
         bot.send_message(chat,"Enter Shopkeeper Name")
 
@@ -460,10 +504,10 @@ def save_report(data):
         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
 
-            data[0], data[1], data[2], data[3], data[4],
+            normalize_district_name(data[0]), data[1], data[2], data[3], data[4],
             data[5], data[6], data[7], data[8],
             datetime.today().strftime("%d-%b-%Y"),
-            data[9], data[10], data[11], data[12]
+            normalize_te_name(data[9]), data[10], data[11], data[12]
 
         ))
 
@@ -485,7 +529,7 @@ def save_report(data):
                 VALUES(?,?,?)
                 """, (
                     serial,
-                    data[0],
+                    normalize_district_name(data[0]),
                     datetime.today().strftime("%d-%m-%Y")
                 ))
 
@@ -514,6 +558,7 @@ def today_report(message):
     today = datetime.today().strftime("%d-%b-%Y")
 
     df = pd.read_sql_query("SELECT * FROM reports WHERE date=?",conn,params=[today])
+    df = clean_report_dataframe(df)
 
     if df.empty:
         bot.send_message(message.chat.id,"No reports today")
@@ -556,9 +601,33 @@ os.makedirs("reports", exist_ok=True)
 def export_excel():
 
     df = pd.read_sql_query("SELECT * FROM reports", conn)
+    df = clean_report_dataframe(df)
 
-    district_summary = df.groupby("district").size().reset_index(name="Total")
-    te_summary = df.groupby("te").size().reset_index(name="Total")
+    if df.empty:
+        raise ValueError("No reports available to export")
+
+    validate_clean_data(df)
+
+    district_summary = (
+        df.groupby("district", as_index=False)
+        .size()
+        .rename(columns={"size": "Total"})
+        .sort_values(by="Total", ascending=False)
+    )
+
+    te_summary = (
+        df.groupby(["te", "district"], as_index=False)
+        .size()
+        .rename(columns={"te": "TE Name", "district": "District", "size": "Total Count"})
+        .sort_values(by="Total Count", ascending=False)
+    )
+
+    spare_summary = (
+        df.groupby(["district", "spare"], as_index=False)
+        .size()
+        .rename(columns={"district": "District", "spare": "Spare Name", "size": "Total Count"})
+        .sort_values(by=["District", "Total Count"], ascending=[True, False])
+    )
 
     now = datetime.now()
 
@@ -580,6 +649,7 @@ def export_excel():
         df.to_excel(writer, sheet_name="Full Report", index=False)
         district_summary.to_excel(writer, sheet_name="District Summary", index=False)
         te_summary.to_excel(writer, sheet_name="TE Performance", index=False)
+        spare_summary.to_excel(writer, sheet_name="Spare-wise District Summary", index=False)
 
     # ================= FORMAT EXCEL =================
 
@@ -632,18 +702,8 @@ def export_excel():
         # ================= AUTO WIDTH =================
 
         for col in ws.columns:
-
-            max_length = 0
             column = col[0].column_letter
-
-            for cell in col:
-
-                try:
-                    if cell.value:
-                        max_length = max(max_length, len(str(cell.value)))
-                except:
-                    pass
-
+            max_length = max(len(str(cell.value)) if cell.value is not None else 0 for cell in col)
             ws.column_dimensions[column].width = max_length + 3
 
     wb.save(file)
@@ -674,6 +734,7 @@ def district_summary(message):
         return
 
     df = pd.read_sql_query("SELECT * FROM reports", conn)
+    df = clean_report_dataframe(df)
 
     if df.empty:
         bot.send_message(message.chat.id,"No reports available")
@@ -702,7 +763,7 @@ def district_report(message):
         bot.send_message(message.chat.id,"Usage:\n/district Salem")
         return
 
-    district_name = parts[1]
+    district_name = normalize_district_name(parts[1])
 
     df = pd.read_sql_query(
         "SELECT * FROM reports WHERE district=?",
@@ -713,6 +774,8 @@ def district_report(message):
     if df.empty:
         bot.send_message(message.chat.id,"No reports for this district")
         return
+
+    df = clean_report_dataframe(df)
 
     msg = f"📊 Reports for {district_name}\n\n"
 
@@ -737,6 +800,7 @@ def pending(message):
         conn,
         params=[today]
     )
+    df = clean_report_dataframe(df)
 
     if df.empty:
         bot.send_message(message.chat.id,"No tickets today")
@@ -769,6 +833,7 @@ def te_summary(message):
             conn,
             params=[today]
         )
+        df = clean_report_dataframe(df)
 
         title = "📊 Today District-wise TE Performance\n\n"
 
@@ -778,6 +843,7 @@ def te_summary(message):
             "SELECT district,te FROM reports",
             conn
         )
+        df = clean_report_dataframe(df)
 
         title = "📊 Overall District-wise TE Performance\n\n"
 
@@ -853,6 +919,7 @@ def live_status(message):
         conn,
         params=[today]
     )
+    df = clean_report_dataframe(df)
 
     if df.empty:
         bot.send_message(message.chat.id,"No reports today")

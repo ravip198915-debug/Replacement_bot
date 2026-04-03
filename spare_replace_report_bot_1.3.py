@@ -171,26 +171,35 @@ spares = sorted(data["Name of Spare Replaced"].dropna().unique())
 # ================= LOAD EMPLOYEE MASTER =================
 
 EMPLOYEE_MASTER_FILE = "Emp_code_name.xlsx"
+EMP_MAP = {}
 
 try:
     emp_df = pd.read_excel(EMPLOYEE_MASTER_FILE)
     emp_df.columns = [col.strip().lower().replace(" ", "_") for col in emp_df.columns]
-    emp_df.rename(
-        columns={
-            "employee_code": "employee_code",
-            "employee_name": "employee_name"
-        },
-        inplace=True
-    )
+
+    if "employee_code" not in emp_df.columns:
+        for col in emp_df.columns:
+            if "code" in col:
+                emp_df.rename(columns={col: "employee_code"}, inplace=True)
+                break
+
+    if "employee_name" not in emp_df.columns:
+        for col in emp_df.columns:
+            if "name" in col:
+                emp_df.rename(columns={col: "employee_name"}, inplace=True)
+                break
+
     if "employee_code" not in emp_df.columns or "employee_name" not in emp_df.columns:
         raise ValueError("Missing required columns: employee_code and employee_name")
 
     emp_df["employee_code"] = emp_df["employee_code"].astype(str).str.strip()
     emp_df["employee_name"] = emp_df["employee_name"].astype(str).map(normalize_te_name)
     emp_df = emp_df[emp_df["employee_code"] != ""].drop_duplicates(subset=["employee_code"], keep="first")
+    EMP_MAP = dict(zip(emp_df["employee_code"], emp_df["employee_name"]))
 except Exception as e:
     print(f"WARNING: Unable to load {EMPLOYEE_MASTER_FILE}: {e}")
     emp_df = pd.DataFrame(columns=["employee_code", "employee_name"])
+    EMP_MAP = {}
 
 # ================= START COMMAND =================
 
@@ -348,7 +357,7 @@ def handler(message):
             # Leave new_serial blank
             user[chat]["data"].append("")
 
-            bot.send_message(chat,"Enter Employee Code (Example: 8110)")
+            bot.send_message(chat,"Enter Employee Code (Example: 1608)")
             user[chat]["step"] = "te_code"
     # ================= SERIAL SEARCH =================
 
@@ -394,7 +403,7 @@ def handler(message):
 
         print("Saving serial:", full_serial)
 
-        bot.send_message(chat,"Enter Employee Code (Example: 8110)",reply_markup=ReplyKeyboardRemove())
+        bot.send_message(chat,"Enter Employee Code (Example: 1608)",reply_markup=ReplyKeyboardRemove())
 
         user[chat]["step"] = "te_code"
 
@@ -402,36 +411,26 @@ def handler(message):
         code = text.strip()
 
         if not code:
-            bot.send_message(chat, "❌ Employee code cannot be empty. Enter Employee Code (Example: 8110)")
+            bot.send_message(chat, "❌ Employee code cannot be empty. Enter Employee Code (Example: 1608)")
             return
 
         if not code.isdigit():
-            bot.send_message(chat, "❌ Enter valid numeric employee code")
+            bot.send_message(chat, "❌ Enter valid employee code")
             return
 
-        match = emp_df[emp_df["employee_code"] == code]
-
-        if not match.empty:
-            name = match.iloc[0]["employee_name"]
-            te_value = f"{code} - {name}"
+        name = EMP_MAP.get(code)
+        if name:
+            te_value = f"{code}-{name}"
+            user[chat]["employee_code"] = code
+            user[chat]["te_name"] = name
+            user[chat]["te_display"] = te_value
             user[chat]["data"].append(te_value)
-            bot.send_message(chat, f"✅ {te_value}")
+            bot.send_message(chat, f"✅ Selected: {te_value}")
             bot.send_message(chat,"Enter Shopkeeper Name")
             user[chat]["step"] = "shopkeeper_name"
             return
 
-        partial_matches = emp_df[emp_df["employee_code"].str.contains(code, na=False)].head(5)
-        if not partial_matches.empty:
-            options = "\n".join(
-                f"{row.employee_code} - {row.employee_name}" for row in partial_matches.itertuples()
-            )
-            bot.send_message(
-                chat,
-                f"❌ No exact match for {code}.\nDid you mean:\n{options}\n\nPlease enter exact Employee Code."
-            )
-            return
-
-        bot.send_message(chat, "❌ Invalid Employee Code. Please try again.")
+        bot.send_message(chat, "❌ Invalid Employee Code. Try again.")
         return
 
     elif step == "shopkeeper_name":
@@ -556,7 +555,7 @@ def save_report(data):
             normalize_district_name(data[0]), data[1], data[2], data[3], data[4],
             data[5], data[6], data[7], data[8],
             datetime.today().strftime("%d-%b-%Y"),
-            normalize_te_name(data[9]), data[10], data[11], data[12]
+            data[9], data[10], data[11], data[12]
 
         ))
 
@@ -718,6 +717,7 @@ def export_excel():
             .str.extract(r"^\s*[A-Za-z0-9]+\s*-\s*(.*)$", expand=False)
             .fillna(df["te"].astype(str))
         )
+        df["te_name"] = df["te_name"].fillna("")
 
         df["employee_code"] = df["employee_code"].astype(str)
         df["te_name"] = df.apply(
